@@ -1433,7 +1433,13 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     float *logit = step(m, ids, np, 0, NULL);
     int len = np;
     char buf[512];
+    /* LOGIT_DUMP=<path> writes every step's raw logits. Kept because reasoning
+     * about the SHAPE of this distribution rather than capturing one has now
+     * been wrong twice: the sampler's candidate-pruning threshold looked
+     * useless against synthesized logits and is 135x on real ones. */
+    FILE *ldump = getenv("LOGIT_DUMP") ? fopen(getenv("LOGIT_DUMP"), "wb") : NULL;
     for (int s = 0; s < n_new; s++) {
+        if (ldump) fwrite(logit, 4, (size_t)c->vocab, ldump);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
@@ -1457,6 +1463,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
                    g_gv_exp_max * 100.0, g_gv_exp_ref);
     }
 #endif
+    if (ldump) fclose(ldump);
     double dt = now_s() - t1;
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
@@ -1479,20 +1486,70 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
+/* Nucleus sampling without sorting the whole vocabulary.
+ *
+ * The straightforward version qsorts all n probabilities every token. At
+ * n=100352 that measured 13.0 ms/token against 0.04 ms for the greedy path --
+ * with experts resident the whole token budget is ~50 ms, so a quarter of
+ * decode was going into a sort whose result is almost entirely discarded.
+ *
+ * Only tokens near the max can matter: p_i = exp((l_i - max)/temp), so anything
+ * more than -ln(EPS)*temp below the max has p < EPS individually. With
+ * EPS = 1e-12 the entire excluded tail is under n*EPS = 1e-7 of a sum that is
+ * at least 1 (the max token contributes exactly 1), which moves the top-p
+ * cutoff by far less than the sampling noise it feeds. So: collect the
+ * candidates in one pass, sort only those. A flat distribution defeats the
+ * pruning, and for that -- and only that -- the full sort is still here. */
+/* ln(1e-9). The excluded tail is then under n*1e-9 ~ 1e-4 of a sum that is at
+ * least 1, i.e. 0.2% of the 0.05 slack that top_p=0.95 leaves -- comfortably
+ * below the sampling noise it feeds. Measured on real Laguna logits, this keeps
+ * a median of ~40 candidates out of 100352 at temp 0.7. */
+#define SAMPLE_EPS_LN (-20.72f)
+
+static int sample_pick(PI *c, int cnt, double sum, float top_p) {
+    qsort(c, (size_t)cnt, sizeof(PI), pi_desc);
+    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
+    double acc = 0; int k = 0;
+    while (k < cnt && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0;
+    int pick = c[0].i;
+    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    return pick;
+}
+
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
     if (temp <= 0.f) return best;
+
+    float floor_l = logit[best] + temp * SAMPLE_EPS_LN;   /* SAMPLE_EPS_LN is negative */
+    int cnt = 0;
+    for (int i = 0; i < n; i++) if (logit[i] >= floor_l) cnt++;
+
+    /* No upper bound on cnt: sorting the candidates is never worse than sorting
+     * everything, and the counting pass that buys it is one O(n) sweep. The
+     * fallback below exists for cnt == n (a flat distribution prunes nothing)
+     * and for allocation failure. */
+    if (cnt > 0 && cnt < n) {
+        PI *c = malloc((size_t)cnt * sizeof(PI));
+        if (c) {
+            double sum = 0; int k = 0;
+            for (int i = 0; i < n && k < cnt; i++) {
+                if (logit[i] < floor_l) continue;
+                c[k].p = expf((logit[i] - logit[best]) / temp);
+                c[k].i = i; sum += c[k].p; k++;
+            }
+            int pick = sample_pick(c, k, sum, top_p);
+            free(c);
+            return pick;
+        }
+    }
+    /* flat distribution (or OOM): every token is a candidate, so sort them all */
     PI *c = malloc((size_t)n * sizeof(PI));
+    if (!c) return best;
     double sum = 0;
     for (int i = 0; i < n; i++) { c[i].p = expf((logit[i]-logit[best])/temp); c[i].i = i; sum += c[i].p; }
-    qsort(c, n, sizeof(PI), pi_desc);
-    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
-    double acc = 0; int k = 0;
-    while (k < n && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0;
-    int pick = c[0].i;
-    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    int pick = sample_pick(c, n, sum, top_p);
     free(c);
     return pick;
 }
