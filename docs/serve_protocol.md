@@ -22,12 +22,20 @@ summarized at the end. Line formats below are quoted from the emitting `printf`s
 STAT 0 0.00 0.0 <rss_gb>
 HWINFO <cores> <ram_total_gb> <ram_avail_gb> <ngpu> <vram_total_gb> <cpu_name>|<gpu_name>
 TIERS <vram_experts> <ram_experts> <disk_experts> <vram_gb> <ram_gb>
+GPUMEM <used_gb> <total_gb>            # optional; only engines with resident non-expert weights
 EMAP <rows> <cols> <hex>
 ```
 
 The server must not send requests before `READY`. `HWINFO`/`TIERS`/`EMAP` are
 telemetry (see below) and may grow — **servers must ignore line kinds they do not
 recognize**; that is the protocol's forward-compatibility rule.
+
+> ⚠ `openai_server.py` does **not** currently honour that rule: its dispatcher
+> raises `invalid engine response` on any unrecognized kind. So in practice a new
+> line kind requires the engine and the bundled server to move together, and an
+> older server paired with a newer engine fails rather than degrading. `GPUMEM`
+> was added under that constraint. Worth fixing in the server, not the doc — the
+> rule above is the one worth keeping.
 
 ## Requests (server → engine)
 
@@ -82,6 +90,7 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 |---|---|---|
 | `TIERS` | `TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>` | expert count per tier + resident bytes |
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
+| `GPUMEM` | `GPUMEM <used_gb> <total_gb>` | weights the engine holds in VRAM. **Not** a substitute for `TIERS`'s `vram_gb`, which counts EXPERTS: `laguna` keeps zero experts in VRAM while holding several GB of dense attention/`lm_head` weight, so the two report different things. Optional — engines that put nothing but experts on the GPU never send it. |
 | `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |
