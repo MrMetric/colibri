@@ -1105,7 +1105,7 @@ def main():
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
-                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID",""))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
                    ("--cors-origin",dict(action="append",default=None)),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
