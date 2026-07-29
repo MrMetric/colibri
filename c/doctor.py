@@ -98,13 +98,17 @@ def _tensor_layout(meta, payload_size):
 def _shard_sequence_report(shards):
     hf_shards = []
     out_shards = []
+    expert_shards = []
     for shard in shards:
         hf_match = re.fullmatch(r"model-(\d+)-of-(\d+)\.safetensors", shard.name)
         out_match = re.fullmatch(r"out-(\d+)\.safetensors", shard.name)
+        expert_match = re.fullmatch(r"out-experts-(\d+)\.safetensors", shard.name)
         if hf_match:
             hf_shards.append(tuple(map(int, hf_match.groups())))
         elif out_match:
             out_shards.append(int(out_match.group(1)))
+        elif expert_match:
+            expert_shards.append(int(expert_match.group(1)))
     if hf_shards and out_shards:
         return {
             "status": "fail",
@@ -141,32 +145,53 @@ def _shard_sequence_report(shards):
             "summary": "all filename-declared shards are present",
             "details": {"declared_shards": total, "found_shards": len(found)},
         }
-    if out_shards:
-        found = set(out_shards)
-        first = min(found)
-        last = max(found)
-        missing = last + 1 - len(found)
-        duplicates = len(out_shards) - len(found)
-        if missing or duplicates:
+    if out_shards or expert_shards:
+        # Check non-expert out-N shards for contiguity (may be just 1 shard)
+        issues = {}
+        if out_shards:
+            found = set(out_shards)
+            first = min(found)
+            last = max(found)
+            # Contiguity: every integer in [first, last] must be present.
+            # A single shard (first==last) is always contiguous.
+            expected = set(range(first, last + 1))
+            missing = len(expected - found)
+            duplicates = len(out_shards) - len(found)
+            if missing or duplicates:
+                issues["non_expert"] = {
+                    "first_shard": first, "last_shard": last,
+                    "found_shards": len(found), "missing_shards": missing,
+                    "duplicate_shards": duplicates,
+                }
+        # Check expert out-experts-N shards for contiguity
+        if expert_shards:
+            efound = set(expert_shards)
+            efirst = min(efound)
+            elast = max(efound)
+            emissing = elast + 1 - len(efound)
+            eduplicates = len(expert_shards) - len(efound)
+            if emissing or eduplicates:
+                issues["expert"] = {
+                    "first_shard": efirst, "last_shard": elast,
+                    "found_shards": len(efound), "missing_shards": emissing,
+                    "duplicate_shards": eduplicates,
+                }
+        if issues:
             return {
                 "status": "fail",
                 "summary": "converter shard numbering contains gaps or duplicates",
-                "details": {
-                    "first_shard": first,
-                    "last_shard": last,
-                    "found_shards": len(found),
-                    "missing_shards": missing,
-                    "duplicate_shards": duplicates,
-                    "tail_completeness_declared": False,
-                },
+                "details": {**issues.get("non_expert", {}),
+                            "expert_shards": len(expert_shards),
+                            "tail_completeness_declared": False},
             }
         return {
             "status": "pass",
             "summary": "converter shard numbering is contiguous",
             "details": {
-                "first_shard": min(found),
-                "last_shard": max(found),
-                "found_shards": len(found),
+                "first_shard": min(out_shards) if out_shards else None,
+                "last_shard": max(out_shards) if out_shards else None,
+                "found_shards": len(out_shards),
+                "expert_shards": len(expert_shards),
                 "tail_completeness_declared": False,
             },
         }

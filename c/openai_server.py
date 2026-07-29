@@ -374,7 +374,7 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
+ARCH = "glm"   # set in main(): "glm" | "inkling" | "laguna" (auto-detected from the model's config.json)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -515,6 +515,57 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     # mode; it is exactly the sequence every non-thinking turn is trained on.
     if eff == 0.0:
         prompt.append("<|content_text|>")
+    return "".join(prompt)
+
+
+def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                        tool_choice=None):
+    """Render the text-only subset of Laguna's chat_template.jinja.
+
+    Laguna uses <system>/<user>/<assistant> tags with a default system message.
+    This is a base model that was post-trained with this template."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Laguna engine yet.",
+                       "tools", "unsupported_parameter")
+    prompt = ["〈|EOS|〉"]
+    # Extract system message (first if present), apply default otherwise
+    system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations."
+    msg_list = messages
+    if messages and messages[0].get("role") == "system":
+        system_message = messages[0].get("content", "")
+        msg_list = messages[1:]
+    has_sys = system_message and system_message.strip()
+    if has_sys or enable_thinking:
+        prompt.append("<system>")
+        if has_sys:
+            prompt.append(system_message.rstrip())
+        prompt.append("</system>\n")
+    for message in msg_list:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            content = ""
+        if role == "user":
+            prompt.append("<user>" + content + "</user>\n")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            if enable_thinking:
+                prompt.append("<assistant>\u2241" + reasoning + "\u2243")
+            else:
+                prompt.append("<assistant>\u2243")
+            if content:
+                prompt.append(content)
+            prompt.append("</assistant>\n")
+        elif role == "system":
+            prompt.append("<system>" + content + "</system>\n")
+    # Generation prompt
+    prompt.append("<assistant>")
+    if enable_thinking:
+        prompt.append("\u2241")
+    else:
+        prompt.append("\u2243")
     return "".join(prompt)
 
 
@@ -838,7 +889,9 @@ GENERIC_JSON_GBNF = (
     'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
 )
 
-DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+# Stop sequences: GLM uses ≁/</s>, Laguna uses </assistant>
+DEFAULT_CHAT_STOP_SEQUENCES = ("\u226d", "</s>")
+LAGUNA_STOP_SEQUENCES = ("</assistant>",)
 
 
 def parse_stop_sequences(body):
@@ -899,13 +952,13 @@ def stop_policy(body, chat):
     if not isinstance(ignore_leading, bool):
         raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
                        "x_colibri_ignore_leading_stop", "invalid_value")
-    if chat and ARCH == "glm" and not sequences:
-        # The GLM chat template owns these role boundaries, so generic OpenAI
-        # clients should not need model-specific stop knowledge. Inkling has a
-        # different marker family and receives no implicit GLM stops. Treat an
-        # occasional leading GLM marker patiently; client-provided stops remain
-        # strict unless the extension is explicitly requested.
-        return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and ARCH in ("glm", "laguna") and not sequences:
+        # The GLM and Laguna chat templates own their role boundaries, so
+        # generic OpenAI clients should not need model-specific stop knowledge.
+        stops = LAGUNA_STOP_SEQUENCES if ARCH == "laguna" else DEFAULT_CHAT_STOP_SEQUENCES
+        # Treat an occasional leading marker patiently; client-provided stops
+        # remain strict unless the extension is explicitly requested.
+        return stops, True
     return sequences, ignore_leading
 
 
@@ -1995,7 +2048,12 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = render_chat_inkling if ARCH == "inkling" else render_chat
+        if ARCH == "inkling":
+            renderer = render_chat_inkling
+        elif ARCH == "laguna":
+            renderer = render_chat_laguna
+        else:
+            renderer = render_chat
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
@@ -2030,7 +2088,13 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
+        if ARCH == "inkling":
+            renderer = render_chat_inkling
+        elif ARCH == "laguna":
+            renderer = render_chat_laguna
+        else:
+            renderer = render_chat
+        prompt = renderer(messages, enable_thinking, "high" if enable_thinking else None,
                              tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
@@ -2252,11 +2316,24 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id="", api_key=None,
           cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
     if engine is None:
         engine = default_engine()
+    # Auto-detect model_id from config.json if not explicitly set
+    if not model_id:
+        try:
+            with open(Path(model) / "config.json") as fh:
+                mt = json.load(fh).get("model_type") or ""
+                if "laguna" in mt:
+                    model_id = "laguna-colibri"
+                elif "inkling" in mt:
+                    model_id = "inkling-colibri"
+                else:
+                    model_id = "glm-5.2-colibri"
+        except OSError:
+            model_id = "glm-5.2-colibri"
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -2302,7 +2379,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "laguna"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2327,11 +2404,22 @@ def main():
     if ARCH == "auto":
         try:
             with open(Path(args.model) / "config.json") as fh:
-                ARCH = "inkling" if "inkling" in (json.load(fh).get("model_type") or "") else "glm"
+                mt = json.load(fh).get("model_type") or ""
+                if "laguna" in mt:
+                    ARCH = "laguna"
+                elif "inkling" in mt:
+                    ARCH = "inkling"
+                else:
+                    ARCH = "glm"
         except OSError:
             ARCH = "glm"
     if args.model_id is None:
-        args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
+        if ARCH == "inkling":
+            args.model_id = "inkling-colibri"
+        elif ARCH == "laguna":
+            args.model_id = "laguna-colibri"
+        else:
+            args.model_id = "glm-5.2-colibri"
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

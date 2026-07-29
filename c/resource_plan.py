@@ -12,7 +12,9 @@ from pathlib import Path
 
 
 GB = 1_000_000_000
-EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+# Match per-expert tensors (experts.N.gate_proj) or fused expert tensors
+# (experts.gate_up_proj / experts.down_proj) in converted colibri snapshots.
+EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(?:(\d+)\.|gate_up_proj|down_proj)")
 
 
 def _tensor_sizes(path):
@@ -46,17 +48,39 @@ def analyze_model(model):
 
     dense_bytes = 0
     expert_groups = {}
+    fused_layers = set()
     for shard in shards:
         for name, size in _tensor_sizes(shard):
             match = EXPERT_RE.search(name)
             if match:
-                key = tuple(map(int, match.groups()))
+                layer = int(match.group(1))
+                eid = match.group(2)
+                if eid is not None:
+                    key = (layer, int(eid))
+                else:
+                    # Fused 3D tensor: gate_up_proj or down_proj holds all experts.
+                    # Use eid=-1 and track the layer to divide by n_experts later.
+                    key = (layer, -1)
+                    fused_layers.add(layer)
                 expert_groups[key] = expert_groups.get(key, 0) + size
             else:
                 dense_bytes += size
 
+    # For fused layers, a single tensor pair (gate_up_proj + down_proj) holds
+    # all E experts. Divide by n_experts to get per-expert size.
+    n_experts = int(config.get("num_experts") or 0) or 1
+    if fused_layers:
+        for layer in fused_layers:
+            key = (layer, -1)
+            if key in expert_groups:
+                expert_groups[key] = expert_groups[key] // n_experts
+                # Split into pseudo-individual experts so layer_sizes has E entries
+                total = expert_groups.pop(key)
+                for e in range(n_experts):
+                    expert_groups[(layer, e)] = total
+
     layer_sizes = {}
-    for (layer, _), size in expert_groups.items():
+    for (layer, eid), size in expert_groups.items():
         layer_sizes.setdefault(layer, []).append(size)
     per_layer = {layer: int(statistics.median(sizes)) for layer, sizes in layer_sizes.items()}
     per_cap_bytes = sum(per_layer.values())

@@ -70,11 +70,44 @@ _EXE = ".exe" if sys.platform == "win32" else ""
 _LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
 _here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
+_here_laguna = os.path.join(HERE, "laguna" + _EXE)
+
+# ---------- engine selection: model_type -> binary ----------
+# Each architecture has its own C engine. The coli script reads model_type
+# from config.json to pick the right one. COLI_ENGINE overrides everything.
+_ENGINE_BY_TYPE = {
+    "glm_moe_dsa": "colibri",
+    "laguna":      "laguna",
+    # future: "inkling", "olmoe", etc.
+}
+
+def _engine_for_model(model_dir):
+    """Return the engine binary path for the model in model_dir, or None."""
+    import json as _json
+    cfg_path = os.path.join(model_dir, "config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = _json.load(f)
+        mt = cfg.get("model_type", "")
+    except (OSError, ValueError):
+        return None
+    bin_name = _ENGINE_BY_TYPE.get(mt)
+    if not bin_name:
+        return None
+    cand = os.path.join(HERE, bin_name + _EXE)
+    if os.path.exists(cand):
+        return cand
+    cand = os.path.join(_LIBEXEC, bin_name + _EXE)
+    if os.path.exists(cand):
+        return cand
+    return None
 
 if os.environ.get("COLI_ENGINE"):
     GLM = os.environ["COLI_ENGINE"]
     TOOLS = os.path.join(os.path.dirname(GLM), "tools")
 elif os.path.exists(_here_colibri):
+    # Default to colibri (GLM-5.2) for backward compat; will be overridden
+    # by _engine_for_model() at serve time if the model has a different type.
     GLM = _here_colibri
     TOOLS = os.path.join(HERE, "tools")
 elif os.path.exists(_here_glm):
@@ -560,22 +593,36 @@ def cmd_doctor(a):
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
     report=run_doctor(
-        a.model, ram, ctx, devices, vram, engine_path=GLM, deep=a.deep,
+        a.model, ram, ctx, devices, vram, engine_path=_resolve_engine(a.model), deep=a.deep,
         mirror_dir=os.environ.get("COLI_MODEL_MIRROR"),
     )
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
+def _resolve_engine(model):
+    """Return the engine binary for this model, falling back to GLM."""
+    eng = _engine_for_model(model)
+    if eng:
+        return eng
+    return GLM
+
 def cmd_run(a):
     need_model(a.model)
+    engine = _resolve_engine(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
-    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
-    sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<nothink>"
+    e=env_for(a)
+    # GLM-5.2 engine reads the prompt from PROMPT env var; Laguna uses -p/-n flags.
+    if os.path.basename(engine) in ("laguna", "laguna.exe"):
+        ngen = str(a.ngen) if a.ngen else "256"
+        sys.exit(subprocess.call([engine, str(a.cap), "0", "-p", prompt, "-n", ngen], env=e))
+    else:
+        e["PROMPT"]=f"<|user|>\n{prompt}\n<|assistant|>\n{tk}"
+        sys.exit(subprocess.call([engine, str(a.cap)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
     """Is a coli serve alive at `base`? Returns its model_id, or None.
@@ -707,6 +754,7 @@ def cmd_chat(a):
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
+    engine = _resolve_engine(a.model)
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
     # protocol coli reads one byte at a time) never flushes and chat hangs at
@@ -716,7 +764,7 @@ def cmd_chat(a):
     # once the READY sentinel arrives, so the status-line display below works
     # exactly as before. (Do NOT add a concurrent stderr drain thread: on
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
-    p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
+    p=subprocess.Popen([engine,str(a.cap)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
@@ -847,9 +895,10 @@ def cmd_serve(a):
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     from openai_server import serve
+    engine = _resolve_engine(a.model)
     try:
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.cap,a.ngen,engine,env_for(a),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -1008,7 +1057,7 @@ def main():
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
+    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID",""))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))

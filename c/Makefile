@@ -410,6 +410,9 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
+laguna$(EXE): laguna.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h
+	$(CC) $(CFLAGS) laguna.c -o laguna$(EXE) $(LDFLAGS)
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
