@@ -406,6 +406,21 @@ ink-test: backend_cuda_ink.cu backend_cuda_ink.h backend_gpu_compat.h tests/test
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda_ink.cu tests/test_backend_cuda_ink.cu -o backend_cuda_ink_test$(EXE)
 	./backend_cuda_ink_test$(EXE)
 
+# Does laguna's int4 expert container match backend_cuda.cu's fmt=2 layout?
+# Needs a REAL expert, so point SNAP at a converted model; a synthetic fixture
+# would share the very assumption under test. Includes laguna.c to reach its
+# static matmul_q4, hence the -Dmain rename.
+EXPERT_BIN ?= expert.bin
+expert-compat-test: tests/test_expert_int4_compat.c laguna.c backend_cuda.h $(CUDA_OBJ) $(INK_CUDA_OBJ)
+	@test -n "$(SNAP)" || { echo "set SNAP=<converted model dir>" >&2; exit 1; }
+	$(PYTHON) tools/dump_expert.py "$(SNAP)" $(LAYER) $(EXPERT) $(EXPERT_BIN)
+	$(CC) $(CFLAGS) -Dmain=laguna_main_unused tests/test_expert_int4_compat.c \
+		$(CUDA_OBJ) $(INK_CUDA_OBJ) -o expert_compat_test$(EXE) $(LDFLAGS)
+	./expert_compat_test$(EXE) $(EXPERT_BIN)
+
+LAYER  ?= 3
+EXPERT ?= 0
+
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
