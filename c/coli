@@ -258,6 +258,23 @@ def env_for(a):
         e.setdefault("DIRECT", "1")
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
+    elif not e.get("COLI_NO_OMP_TUNE"):
+        # Laguna: preset the engine's OMP tuning here so it holds regardless of the
+        # parent shell. Crucially includes OMP_NUM_THREADS=<physical cores> (SMT
+        # siblings contend on the tiny per-expert matmuls: ~6x slower with one
+        # thread per logical CPU) and OMP_PLACES=cores. With OMP_PROC_BIND preset,
+        # laguna.c skips its self-reexec (see its main()); everything is already
+        # bound correctly from libgomp init. setdefault: explicit overrides win.
+        eng = _engine_for_model(a.model) if a.model else None
+        if eng and os.path.basename(eng) in ("laguna", "laguna.exe"):
+            from resource_plan import physical_cpu_count
+            for k, v in (("OMP_NUM_THREADS", str(physical_cpu_count())),
+                         ("OMP_PLACES", "cores"),
+                         ("OMP_PROC_BIND", "close"),
+                         ("OMP_WAIT_POLICY", "active"),
+                         ("GOMP_SPINCOUNT", "200000"),
+                         ("OMP_DYNAMIC", "FALSE")):
+                e.setdefault(k, v)
     e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
@@ -606,23 +623,36 @@ def _resolve_engine(model):
         return eng
     return GLM
 
+def engine_cap(a, engine):
+    """Default --cap per engine. GLM's expert cache wants 8; laguna's argv[1] is the
+    per-layer expert LRU cap, where 8 equals topk (zero headroom: ~0% hits, every
+    token re-reads all routed experts from disk). 0 = engine auto-sizes from RAM."""
+    if a.cap is not None:
+        return a.cap
+    return 0 if os.path.basename(engine) in ("laguna", "laguna.exe") else 8
+
 def cmd_run(a):
     need_model(a.model)
     engine = _resolve_engine(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
-    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
-    # <think> open so the engine emits its reasoning block; the default stays nothink.
-    tk="<think>" if os.environ.get("THINK","0")=="1" else "<nothink>"
     e=env_for(a)
     # GLM-5.2 engine reads the prompt from PROMPT env var; Laguna uses -p/-n flags.
     if os.path.basename(engine) in ("laguna", "laguna.exe"):
+        # Laguna chat template (chat_template.jinja): default system message, <user> tags,
+        # <assistant> + <think> (thinking) or bare </think> (nothink). The engine prepends BOS.
+        tk="<think>" if os.environ.get("THINK","0")=="1" else "</think>"
+        sysmsg=("You are a helpful, conversationally-fluent assistant made by Poolside. "
+                "You are here to be helpful to users through natural language conversations.")
+        tpl=f"<system>{sysmsg}</system>\n<user>{prompt}</user>\n<assistant>{tk}"
         ngen = str(a.ngen) if a.ngen else "256"
-        sys.exit(subprocess.call([engine, str(a.cap), "0", "-p", prompt, "-n", ngen], env=e))
-    else:
-        e["PROMPT"]=f"<|user|>\n{prompt}\n<|assistant|>\n{tk}"
-        sys.exit(subprocess.call([engine, str(a.cap)], env=e))
+        sys.exit(subprocess.call([engine, str(engine_cap(a, engine)), "0", "-p", tpl, "-n", ngen], env=e))
+    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
+    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
+    # <think> open so the engine emits its reasoning block; the default stays nothink.
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
+    sys.exit(subprocess.call([engine, str(engine_cap(a, engine))], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
     """Is a coli serve alive at `base`? Returns its model_id, or None.
@@ -750,11 +780,16 @@ def cmd_chat(a):
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
+    engine = _resolve_engine(a.model)
+    if os.path.basename(engine) in ("laguna", "laguna.exe"):
+        # laguna.c's serve loop speaks only the SUBMIT protocol (no plain-line chat
+        # mode); direct-spawn chat would hang at the first message.
+        sys.exit("the laguna engine has no direct chat mode yet: start `coli serve "
+                 f"--model {a.model}` and re-run `coli chat` (it attaches automatically)")
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
-    engine = _resolve_engine(a.model)
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
     # protocol coli reads one byte at a time) never flushes and chat hangs at
@@ -764,7 +799,7 @@ def cmd_chat(a):
     # once the READY sentinel arrives, so the status-line display below works
     # exactly as before. (Do NOT add a concurrent stderr drain thread: on
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
-    p=subprocess.Popen([engine,str(a.cap)], env=e, stdin=subprocess.PIPE,
+    p=subprocess.Popen([engine,str(engine_cap(a, engine))], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
@@ -898,7 +933,7 @@ def cmd_serve(a):
     engine = _resolve_engine(a.model)
     try:
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,engine,env_for(a),a.cors_origin,
+              engine_cap(a, engine),a.ngen,engine,env_for(a),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -1033,7 +1068,7 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
-    common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
+    common.add_argument("--cap", type=int, default=None); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")

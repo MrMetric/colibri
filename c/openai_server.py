@@ -551,10 +551,12 @@ def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, t
             prompt.append("<user>" + content + "</user>\n")
         elif role == "assistant":
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            # <think>/</think> are dedicated tokens (18/19); a bare </think> marks a
+            # no-thinking turn, mirroring the official chat_template.jinja.
             if enable_thinking:
-                prompt.append("<assistant>\u2241" + reasoning + "\u2243")
+                prompt.append("<assistant><think>" + reasoning + "</think>")
             else:
-                prompt.append("<assistant>\u2243")
+                prompt.append("<assistant></think>")
             if content:
                 prompt.append(content)
             prompt.append("</assistant>\n")
@@ -563,9 +565,9 @@ def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, t
     # Generation prompt
     prompt.append("<assistant>")
     if enable_thinking:
-        prompt.append("\u2241")
+        prompt.append("<think>")
     else:
-        prompt.append("\u2243")
+        prompt.append("</think>")
     return "".join(prompt)
 
 
@@ -889,8 +891,9 @@ GENERIC_JSON_GBNF = (
     'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
 )
 
-# Stop sequences: GLM uses ≁/</s>, Laguna uses </assistant>
-DEFAULT_CHAT_STOP_SEQUENCES = ("\u226d", "</s>")
+DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+# Laguna ends a turn with </assistant> (token 24, also a config eos_token_id; the
+# engine stops on it — this text stop is the server-side backstop).
 LAGUNA_STOP_SEQUENCES = ("</assistant>",)
 
 
@@ -1749,11 +1752,12 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH == "inkling":
-            # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
-            # grammar payload extension would desync its stdin framing.
-            raise APIError(400, "`response_format` grammars are not supported by the Inkling "
-                                "engine yet.", "response_format", "unsupported_parameter")
+        if grammar is not None and ARCH in ("inkling", "laguna"):
+            # inkling.c's and laguna.c's serve loops speak the 6-field SUBMIT header only;
+            # sending the grammar payload extension would desync their stdin framing.
+            raise APIError(400, f"`response_format` grammars are not supported by the "
+                                f"{ARCH.capitalize()} engine yet.",
+                           "response_format", "unsupported_parameter")
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":

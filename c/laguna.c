@@ -34,6 +34,9 @@
 #include "tok.h"
 #include "json.h"
 #include "compat.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -57,7 +60,8 @@ typedef struct {
     int shared_inter;      /* shared_expert_intermediate_size */
     float eps, route_scale; /* rms_norm_eps, moe_routed_scaling_factor */
     int norm_topk;          /* norm_topk_prob */
-    int eos, bos;
+    int eos_ids[8], n_eos;  /* config eos_token_id may be a list (Laguna: [〈|EOS|〉, </assistant>]) */
+    int bos;
     /* RoPE: full-attention layers */
     float rope_theta_full;
     int   rope_type_full;   /* 0=default, 1=yarn */
@@ -137,6 +141,10 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
 static float softplusf(float x) { return x > 20.f ? x : logf(1.f + expf(x)); }
+static int is_eos(const Cfg *c, int t) {
+    for (int i = 0; i < c->n_eos; i++) if (c->eos_ids[i] == t) return 1;
+    return 0;
+}
 
 /* ---------- matmuls (same as inkling.c) ---------- */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -472,12 +480,14 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->swa_kv  = c->n_kv;
     c->swa_hd  = c->head_dim;
 
-    /* eos + bos */
+    /* eos + bos; every listed eos id ends generation (24 = </assistant> is the turn end) */
     jval *eo = json_get(root,"eos_token_id");
-    c->eos = -1;
+    c->n_eos = 0;
     if (eo) {
-        if (eo->t == J_NUM) c->eos = (int)eo->num;
-        else if (eo->t == J_ARR && eo->len > 0) c->eos = (int)eo->kids[0]->num;
+        if (eo->t == J_NUM) c->eos_ids[c->n_eos++] = (int)eo->num;
+        else if (eo->t == J_ARR)
+            for (int i = 0; i < eo->len && c->n_eos < 8; i++)
+                c->eos_ids[c->n_eos++] = (int)eo->kids[i]->num;
     }
     jval *bo = json_get(root,"bos_token_id");
     c->bos = bo && bo->t == J_NUM ? (int)bo->num : -1;
@@ -1177,8 +1187,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int *ids = malloc(cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
-    /* prepend BOS if the model has one (Laguna was trained with BOS) */
-    if (c->bos >= 0) {
+    /* prepend BOS if the model has one (Laguna was trained with BOS) — unless the
+     * rendered template already starts with it (Laguna's emits 〈|EOS|〉 itself) */
+    if (c->bos >= 0 && ids[0] != c->bos) {
         ids = realloc(ids, (np + 1) * sizeof(int));
         memmove(ids + 1, ids, np * sizeof(int));
         ids[0] = c->bos;
@@ -1195,7 +1206,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
         if (s == 0) t1 = now_s();
-        if (best == c->eos) { printf("\n[eos after %d tokens]", s); break; }
+        if (is_eos(c, best)) { printf("\n[eos after %d tokens]", s); break; }
         int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
         buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
         int one = best; len++;
@@ -1298,8 +1309,8 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
-    /* prepend BOS if the model has one */
-    if (c->bos >= 0) {
+    /* prepend BOS if the model has one — unless the rendered template already starts with it */
+    if (c->bos >= 0 && ids[0] != c->bos) {
         ids = realloc(ids, (size_t)(np + 1) * sizeof(int));
         memmove(ids + 1, ids, np * sizeof(int));
         ids[0] = c->bos;
@@ -1322,7 +1333,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         apply_rep_penalty(logit, c->vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->vocab, q->temp, q->top_p);
         free(logit); logit = NULL;
-        if (tk == c->eos) { limited = 0; break; }
+        if (is_eos(c, tk)) { limited = 0; break; }
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
@@ -1423,6 +1434,30 @@ static void serve_loop(Model *m, Tok *T) {
     }
 }
 
+/* one thread per PHYSICAL core: SMT siblings share the vector units and the
+ * per-expert matmul regions are tiny, so one thread per logical CPU measures
+ * ~6x SLOWER than one per core (0.72 vs 4.1 tok/s on a 5950X). */
+static int physical_cores(void) {
+#ifdef __linux__
+    int n = 0;
+    for (int c = 0; ; c++) {
+        char p[128];
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+        FILE *f = fopen(p, "r");
+        if (!f) break;
+        int first = -1;
+        if (fscanf(f, "%d", &first) == 1 && first == c) n++;
+        fclose(f);
+    }
+    if (n > 0) return n;
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    long nc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nc > 0) return (int)nc;
+#endif
+    return 0;
+}
+
 /* ---------- oracle harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -1435,14 +1470,32 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 int main(int argc, char **argv) {
 #ifndef COLI_CUDA
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
+        /* If OMP_PROC_BIND/OMP_PLACES were already in the environment, libgomp
+         * bound this initial thread to a single-CPU place BEFORE main() ran; an
+         * execv would carry that one-CPU affinity mask into the new image, whose
+         * libgomp would then size the whole team at 1 thread (the mask survives
+         * exec). In that case skip the re-exec: binding is already configured,
+         * and the team size can still be fixed through the API. */
+        int bind_preset = getenv("OMP_PROC_BIND") || getenv("OMP_PLACES");
+        char nt[16] = "";
+        if (!getenv("OMP_NUM_THREADS")) {
+            int pc = physical_cores();
+            if (pc > 0) { snprintf(nt, sizeof(nt), "%d", pc); setenv("OMP_NUM_THREADS", nt, 0); }
+        }
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
+        setenv("OMP_PLACES","cores",0);
         setenv("OMP_PROC_BIND","close",0);
         setenv("OMP_DYNAMIC","FALSE",0);
         setenv("COLI_OMP_TUNED","1",1);
+        if (!bind_preset) {
 #ifdef __linux__
-        execv("/proc/self/exe", argv);
-        perror("[OMP] execv self-reexec failed, running untuned");
+            execv("/proc/self/exe", argv);
+            perror("[OMP] execv self-reexec failed, running untuned");
+#endif
+        }
+#ifdef _OPENMP
+        else if (nt[0]) omp_set_num_threads(atoi(nt));
 #endif
     }
 #endif
