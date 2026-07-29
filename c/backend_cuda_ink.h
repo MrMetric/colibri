@@ -13,6 +13,11 @@ extern "C" {
 
 int    ink_cuda_init(int dev);                 /* 0 = ok */
 size_t ink_cuda_free_bytes(void);
+size_t ink_cuda_total_bytes(void);
+/* "<marketing name> (<arch>)", e.g. "AMD Radeon Graphics (gfx906)". The arch
+ * matters on a mixed-GPU box, where an ordinal names a position and positions
+ * move when hardware is added. Empty string if the device can't be queried. */
+void   ink_cuda_device_name(char *buf, size_t n);
 void  *ink_cuda_upload(const void *h, size_t n);   /* NULL = OOM/error */
 /* y[S,O] = x[S,I] @ W^T, W = device bf16 [O,I]; x,y host f32. 0 = ok */
 int    ink_cuda_matmul_bf16(float *y, const float *x, const void *W, int S, int I, int O);

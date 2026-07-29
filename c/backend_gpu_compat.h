@@ -56,6 +56,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
 #define cudaSetDevice            hipSetDevice
+#define cudaGetDevice            hipGetDevice
 #define cudaGetDeviceCount       hipGetDeviceCount
 #define cudaDeviceProp           hipDeviceProp_t
 #define cudaGetDeviceProperties  hipGetDeviceProperties

@@ -221,6 +221,8 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 static int    g_gpu_verify;
 static double g_gv_max, g_gv_ref;
 static long   g_gv_calls;
+/* bytes of dense weight actually resident in VRAM, for the dashboard */
+static size_t g_vram_bytes;
 #endif
 
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
@@ -618,7 +620,10 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
 #ifdef COLI_CUDA
         if (g_cuda && gpu_ok && ink_cuda_free_bytes() > (size_t)t->nbytes + (3ULL<<30)) {
             w.dev = ink_cuda_upload(w.h, t->nbytes);
-            if (w.dev && !g_gpu_verify) { free(w.h); w.h = NULL; }
+            if (w.dev) {
+                g_vram_bytes += (size_t)t->nbytes;
+                if (!g_gpu_verify) { free(w.h); w.h = NULL; }
+            }
         }
 #else
         (void)gpu_ok;
@@ -709,8 +714,12 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         if (getenv("GPU_DEV"))                   dev = atoi(getenv("GPU_DEV"));
         else if (gpus && strcmp(gpus, "auto"))   dev = atoi(gpus);
         if (ink_cuda_init(dev) == 0) {
+            char gname[128]; ink_cuda_device_name(gname, sizeof(gname));
             g_cuda = 1;
-            fprintf(stderr, "[cuda] device %d ready, %.1f GB free\n", dev, ink_cuda_free_bytes()/1e9);
+            /* name the silicon, not just the ordinal: with two GPUs installed,
+             * device 0 is whichever one the runtime enumerated first. */
+            fprintf(stderr, "[cuda] device %d = %s, %.1f GB free\n",
+                    dev, gname[0] ? gname : "unknown", ink_cuda_free_bytes()/1e9);
         } else fprintf(stderr, "[cuda] init failed, running on CPU\n");
     }
 #endif
@@ -1421,7 +1430,13 @@ static void serve_hwinfo(Model *m) {
         } fclose(mi); }
     int ngpu = 0; double vram = 0; const char *gpu = "";
 #ifdef COLI_CUDA
-    if (g_cuda) { ngpu = 1; vram = ink_cuda_free_bytes()/1e9; gpu = "CUDA device"; }
+    /* field 5 is VRAM *total*, matching telemetry.h's hwinfo_emit — the
+     * dashboard prints it as the card's capacity. It used to send free bytes,
+     * which reads plausibly (free-at-startup is close to total) and is wrong. */
+    char gname[128] = "";
+    if (g_cuda) { ngpu = 1; vram = ink_cuda_total_bytes()/1e9;
+                  ink_cuda_device_name(gname, sizeof(gname));
+                  gpu = gname[0] ? gname : "CUDA device"; }
 #endif
     (void)m;
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n", cores, rt, ra, ngpu, vram, cpu[0]?cpu:"unknown", gpu);
@@ -1435,7 +1450,17 @@ static void serve_tiers_emap(Model *m) {
     int64_t I = c->moe_inter, D = c->hidden;
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
-    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
+    /* The three counts are EXPERT placement, and laguna puts no expert on the
+     * GPU — every routed expert lives in the RAM cache or on disk — so the
+     * VRAM count is genuinely 0. The GB figure is not: the dense bf16 weights
+     * (attention + lm_head + shared experts) are resident, and reporting 0.00
+     * there told the dashboard the GPU was unused while it was doing half the
+     * decode. Count and bytes describe different things here, on purpose. */
+    double vram_gb = 0;
+#ifdef COLI_CUDA
+    vram_gb = g_vram_bytes / 1e9;
+#endif
+    printf("TIERS 0 %d %d %.2f %.2f\n", filled, nsp*E - filled, vram_gb, filled*(double)slotb/1e9);
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;

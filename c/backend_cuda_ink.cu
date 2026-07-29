@@ -47,6 +47,26 @@ extern "C" size_t ink_cuda_free_bytes(void) {
     return fr;
 }
 
+extern "C" size_t ink_cuda_total_bytes(void) {
+    size_t fr = 0, to = 0;
+    if (cudaMemGetInfo(&fr, &to) != cudaSuccess) return 0;
+    return to;
+}
+
+extern "C" void ink_cuda_device_name(char *buf, size_t n) {
+    if (!n) return;
+    buf[0] = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    snprintf(buf, n, "%s (%s)", p.name, p.gcnArchName);
+#else
+    snprintf(buf, n, "%s (sm_%d%d)", p.name, p.major, p.minor);
+#endif
+}
+
 extern "C" void *ink_cuda_upload(const void *h, size_t n) {
     void *d = nullptr;
     if (cudaMalloc(&d, n) != cudaSuccess) return nullptr;
