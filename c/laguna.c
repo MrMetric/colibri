@@ -39,6 +39,7 @@
 #endif
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
+#include "backend_cuda.h"
 static int g_cuda = 0;
 #endif
 
@@ -221,8 +222,22 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 static int    g_gpu_verify;
 static double g_gv_max, g_gv_ref;
 static long   g_gv_calls;
+/* the expert path is checked separately: one counter for two very different
+ * code paths cannot say which of them is wrong */
+static double g_gv_exp_max, g_gv_exp_ref, g_gv_exp_num, g_gv_exp_den;
+static long   g_gv_exp_calls;
 /* bytes of dense weight actually resident in VRAM, for the dashboard */
 static size_t g_vram_bytes;
+
+/* Routed experts held in VRAM for the whole run, indexed [layer][expert]. When
+ * this is on, the LRU slot cache is bypassed entirely: there is nothing to
+ * evict and nothing to stream, so the fill phase stops existing rather than
+ * getting faster. It is all-or-nothing per model -- a partially resident set
+ * would need the cache back for the remainder, which is the shape the larger
+ * Laguna models will want and this is not. */
+static int    g_exp_vram;
+static size_t g_exp_bytes, g_exp_count;
+static ColiCudaTensor ***g_eg, ***g_eu, ***g_ed;
 #endif
 
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
@@ -692,6 +707,92 @@ static double mem_avail_bytes(void) {
 #endif
 }
 
+#ifdef COLI_CUDA
+/* Upload every routed expert to VRAM, or none.
+ *
+ * The container's int4 layout is byte-identical to backend_cuda.cu's fmt=2 --
+ * verified against a double-precision decode of a real expert, with a
+ * nibble-swapped null to prove the check discriminates: tests/
+ * test_expert_int4_compat.c. So the bytes go straight from pread to cudaMalloc
+ * with no repack. gate and up are the contiguous first and second halves of
+ * gate_up, which is why they can be uploaded as two tensors from one read.
+ *
+ * Returns 1 if every expert made it. On any failure the partial set is freed
+ * and the engine keeps its CPU cache path: half-resident is not a state this
+ * code knows how to run. */
+static int experts_upload(Model *m, int dev) {
+	Cfg *c = &m->c;
+	int64_t D = c->hidden, I = c->moe_inter, E = c->n_experts;
+	int64_t wg = I * m->rb13, wd = D * m->rb2;   /* per-expert device bytes, per tensor */
+	int nsp = 0;
+	for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) nsp++;
+
+	size_t need = (size_t)nsp * E * (2 * wg + wd)               /* weights  */
+	            + (size_t)nsp * E * (2 * I + D) * sizeof(float); /* scales   */
+	size_t freeb = 0, totb = 0;
+	if (coli_cuda_mem_info(dev, &freeb, &totb) != 1) return 0;
+	/* Leave headroom for the backend's own activation scratch and for the dense
+	 * tensors the ink backend holds; running the card to the last byte turns a
+	 * capacity problem into a mid-decode allocation failure. */
+	size_t margin = 2ULL << 30;
+	if (need + margin > freeb) {
+		fprintf(stderr, "[cuda] experts stay on CPU: need %.1f GB + %.1f GB margin, %.1f GB free\n",
+		        need / 1e9, margin / 1e9, freeb / 1e9);
+		return 0;
+	}
+
+	g_eg = calloc(c->n_layers, sizeof(*g_eg));
+	g_eu = calloc(c->n_layers, sizeof(*g_eu));
+	g_ed = calloc(c->n_layers, sizeof(*g_ed));
+	uint8_t *w13 = malloc((size_t)(2 * wg)), *w2 = malloc((size_t)wd);
+	float *s13 = malloc((size_t)(2 * I) * sizeof(float)), *s2 = malloc((size_t)D * sizeof(float));
+	if (!g_eg || !g_eu || !g_ed || !w13 || !w2 || !s13 || !s2) { fprintf(stderr, "[cuda] OOM staging experts\n"); return 0; }
+
+	double t0 = now_s();
+	int ok = 1;
+	for (int layer = 0; layer < c->n_layers && ok; layer++) {
+		if (!c->sparse[layer]) continue;
+		g_eg[layer] = calloc(E, sizeof(**g_eg));
+		g_eu[layer] = calloc(E, sizeof(**g_eu));
+		g_ed[layer] = calloc(E, sizeof(**g_ed));
+		if (!g_eg[layer] || !g_eu[layer] || !g_ed[layer]) { ok = 0; break; }
+		char nm[320], qs[340];
+		for (int64_t e = 0; e < E && ok; e++) {
+			snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj", layer);
+			read_u8_slice(&m->S, nm, w13, e * 2 * I * m->rb13, 2 * I * m->rb13);
+			snprintf(qs, sizeof(qs), "%s.qs", nm);
+			read_f32_slice(&m->S, qs, s13, e * 2 * I, 2 * I);
+			snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj", layer);
+			read_u8_slice(&m->S, nm, w2, e * D * m->rb2, D * m->rb2);
+			snprintf(qs, sizeof(qs), "%s.qs", nm);
+			read_f32_slice(&m->S, qs, s2, e * D, D);
+			/* gate = rows [0,I) of gate_up, up = rows [I,2I): contiguous halves */
+			ok &= coli_cuda_tensor_upload(&g_eg[layer][e], w13,      s13,     2, (int)D, (int)I, dev);
+			ok &= coli_cuda_tensor_upload(&g_eu[layer][e], w13 + wg, s13 + I, 2, (int)D, (int)I, dev);
+			ok &= coli_cuda_tensor_upload(&g_ed[layer][e], w2,       s2,      2, (int)I, (int)D, dev);
+			if (ok) { g_exp_count++; g_exp_bytes += (size_t)(2 * wg + wd) + (size_t)(2 * I + D) * sizeof(float); }
+		}
+		if ((layer & 7) == 1)
+			fprintf(stderr, "\r[cuda] uploading experts: %zu/%d", g_exp_count, nsp * (int)E);
+	}
+	free(w13); free(w2); free(s13); free(s2);
+	if (!ok) {
+		fprintf(stderr, "\n[cuda] expert upload failed after %zu; falling back to the CPU cache\n", g_exp_count);
+		for (int layer = 0; layer < c->n_layers; layer++)
+			for (int64_t e = 0; g_eg[layer] && e < E; e++) {
+				if (g_eg[layer][e]) coli_cuda_tensor_free(g_eg[layer][e]);
+				if (g_eu[layer][e]) coli_cuda_tensor_free(g_eu[layer][e]);
+				if (g_ed[layer][e]) coli_cuda_tensor_free(g_ed[layer][e]);
+			}
+		g_exp_count = g_exp_bytes = 0;
+		return 0;
+	}
+	fprintf(stderr, "\r[cuda] %zu experts resident, %.1f GB, in %.0fs\n",
+	        g_exp_count, g_exp_bytes / 1e9, now_s() - t0);
+	return 1;
+}
+#endif
+
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
@@ -768,6 +869,27 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*c->hidden + (2*I+c->hidden)*4
                   : m->quant_bits ? 3*I*c->hidden + (2*I+c->hidden)*4 : 3*I*c->hidden*4;
+#ifdef COLI_CUDA
+    /* Try residency before sizing the RAM cache: if every expert lives in VRAM
+     * the cache is dead weight, and on this model it would otherwise reserve
+     * ~16 GB of host RAM to hold a copy of what the GPU already has. */
+    if (g_cuda && m->xq && m->rb13 * 2 == c->hidden &&
+        (!getenv("EXPERTS_VRAM") || atoi(getenv("EXPERTS_VRAM")))) {
+        int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
+        int devs[1] = { dev };
+        if (coli_cuda_init(devs, 1) > 0 && experts_upload(m, dev)) g_exp_vram = 1;
+        else coli_cuda_shutdown();
+    }
+    /* With every expert resident the RAM cache is dead weight, so it shrinks to
+     * nothing -- EXCEPT under GPU_VERIFY, where the CPU chain is recomputed for
+     * comparison. That needs a slot per DISTINCT expert routed across the whole
+     * batch, not just per token: pass 1 acquires for every (token, k) before
+     * pass 2 fills any of them, so a cache smaller than that aliases earlier
+     * entries onto later fills and the checker reports its own eviction as an
+     * engine fault. It did, twice. Hence the full expert set, and hence
+     * GPU_VERIFY costing the host RAM this mode exists to save. */
+    if (g_exp_vram) cap = g_gpu_verify ? c->n_experts : 1;
+#endif
     if (cap <= 0) {
         double avail = mem_avail_bytes();
         cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
@@ -1071,6 +1193,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++) {
             int eid = si[kk];
             if (m->eusage[layer]) m->eusage[layer][eid]++;
+#ifdef COLI_CUDA
+            if (g_exp_vram && !g_gpu_verify) { use[(int64_t)s*K + kk] = NULL; continue; }
+#endif
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else {
@@ -1096,6 +1221,66 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         float *os = out + (int64_t)s*D;
         float *w = wgt + (int64_t)s*K;
         double te = now_s();
+#ifdef COLI_CUDA
+        if (g_exp_vram) {
+            /* One launch for all K experts of this token. The backend wants
+             * sum(rows) consecutive [D] rows in call order, so the same hidden
+             * state is repeated K times; rows are 1 each because decode routes
+             * one token at a time. */
+            ColiCudaTensor *gs[64], *us[64], *ds[64];
+            int rows[64], n = K > 64 ? 64 : K;
+            float *xin = falloc((int64_t)n * D), *yout = falloc((int64_t)n * D);
+            for (int kk = 0; kk < n; kk++) {
+                int eid = idx[(int64_t)s*K + kk];
+                gs[kk] = g_eg[layer][eid]; us[kk] = g_eu[layer][eid]; ds[kk] = g_ed[layer][eid];
+                rows[kk] = 1;
+                memcpy(xin + (int64_t)kk * D, xs, (size_t)D * sizeof(float));
+            }
+            if (!coli_cuda_expert_group(gs, us, ds, rows, n, yout, xin)) {
+                fprintf(stderr, "coli_cuda_expert_group failed (layer %d)\n", layer); exit(1);
+            }
+            for (int kk = 0; kk < n; kk++) {
+                const float *hg = yout + (int64_t)kk * D;
+                if (g_gpu_verify) {
+                    /* live-path parity: the CPU chain for the same expert, same
+                     * input, run only under the gate because it costs the whole
+                     * saving it exists to check */
+                    Slot *e = use[(int64_t)s*K + kk];
+                    if (e) {
+                        matmul_q4(g, xs, e->p13, e->s13, D, 2*I);
+                        for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                        matmul_q4(hh, g, e->p2, e->s2, I, D);
+                        /* Relative RMS over the whole [D] output, not a
+                         * per-element max. Two simpler statistics both failed
+                         * here: absolute difference is meaningless when expert
+                         * activations span ~1 to ~1e6 across layers, and
+                         * per-element RELATIVE difference is meaningless near
+                         * zero, where a sign flip on a 0.001 element reads as
+                         * 200%. The norm ratio is stable against both, and is
+                         * what tests/test_expert_int4_compat.c uses. */
+                        double num = 0, den = 0;
+                        for (int d = 0; d < D; d++) {
+                            double dv = (double)hg[d] - (double)hh[d];
+                            num += dv * dv; den += (double)hh[d] * hh[d];
+                        }
+                        {
+                            double rel = sqrt(num / (den + 1e-30));
+                            if (rel > g_gv_exp_max) { g_gv_exp_max = rel; g_gv_exp_ref = sqrt(den / D); }
+                            /* aggregate too: the worst SINGLE chain is often a
+                             * near-zero output where any ratio is noise, so the
+                             * magnitude-weighted total is the honest headline. */
+                            g_gv_exp_num += num; g_gv_exp_den += den;
+                        }
+                        g_gv_exp_calls++;
+                    }
+                }
+                for (int d = 0; d < D; d++) os[d] += w[kk] * hg[d];
+            }
+            free(xin); free(yout);
+            m->t_expert += now_s() - te;
+            goto shared;
+        }
+#endif
         for (int kk = 0; kk < K; kk++) {
             Slot *e = use[(int64_t)s*K + kk];
             if (m->xq) {
@@ -1119,7 +1304,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
-        double ts = now_s(); m->t_expert += ts - te;
+        m->t_expert += now_s() - te;
+shared: ;
+        double ts = now_s();
         /* shared expert (unscaled — route_scale only applies to routed experts) */
         matmul_w(g, xs, l->sh_g, 1, D, I);
         matmul_w(u, xs, l->sh_u, 1, D, I);
@@ -1260,8 +1447,15 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     }
 #ifdef COLI_CUDA
     if (g_gpu_verify)
-        printf("\n[gpu-verify] %ld checked matmuls, worst |gpu-cpu| = %.6g (that element |cpu| = %.6g)\n",
+    {
+        printf("\n[gpu-verify] dense  : %ld matmuls, worst |gpu-cpu| = %.6g (|cpu| there = %.6g)\n",
                g_gv_calls, g_gv_max, g_gv_ref);
+        if (g_gv_exp_calls)
+            printf("[gpu-verify] experts: %ld chains, aggregate rel-RMS = %.4f%%"
+                   " (worst single chain %.2f%% at magnitude %.3g)\n",
+                   g_gv_exp_calls, sqrt(g_gv_exp_num / (g_gv_exp_den + 1e-30)) * 100.0,
+                   g_gv_exp_max * 100.0, g_gv_exp_ref);
+    }
 #endif
     double dt = now_s() - t1;
     int gen = len - np;
@@ -1447,7 +1641,7 @@ static void serve_hwinfo(Model *m) {
      * bf16. Folding the bytes into the expert row produced a "VRAM 0 · 3.6 GB"
      * legend — two taxonomies in one line. This belongs beside the GPU's
      * capacity in the runtime panel instead. */
-    if (g_cuda) { printf("GPUMEM %.2f %.2f\n", g_vram_bytes/1e9, vram); }
+    if (g_cuda) { printf("GPUMEM %.2f %.2f\n", (g_vram_bytes + g_exp_bytes)/1e9, vram); }
 #endif
     fflush(stdout);
 }
@@ -1460,10 +1654,15 @@ static void serve_tiers_emap(Model *m) {
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
     /* Both VRAM figures are 0 because this row is EXPERT placement and laguna
-     * puts no expert on the GPU — every routed expert lives in the RAM cache
-     * or on disk. The dense weights that DO sit in VRAM are reported by
-     * GPUMEM, not here; see serve_hwinfo. */
-    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
+     * puts no expert on the GPU unless EXPERTS_VRAM made the whole
+     * set resident, in which case the counts say so. Either way the DENSE
+     * weights in VRAM are a different thing and go out as GPUMEM, not here. */
+    int vram_n = 0; double vram_gb = 0;
+#ifdef COLI_CUDA
+    if (g_exp_vram) { vram_n = (int)g_exp_count; vram_gb = g_exp_bytes / 1e9; filled = 0; }
+#endif
+    printf("TIERS %d %d %d %.2f %.2f\n", vram_n, filled, nsp*E - vram_n - filled,
+           vram_gb, filled*(double)slotb/1e9);
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;

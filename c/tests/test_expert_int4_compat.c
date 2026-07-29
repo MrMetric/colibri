@@ -132,6 +132,82 @@ int main(int argc, char **argv) {
         coli_cuda_tensor_free(tensor);
     }
 
+    /* ---- the fused expert pipeline, which is what the engine actually calls ----
+     * y = down(silu(gate(x)) * up(x)) for ONE expert, against the same chain run
+     * through laguna's CPU kernels. The per-matmul checks above can pass while
+     * this fails, because this exercises a different thing: the gate/up split,
+     * the argument layout, and whatever the backend does between the matmuls. */
+    {
+        int Iff = O13 / 2;                       /* gate and up are halves of gate_up */
+        size_t half = (size_t)Iff * (D / 2);
+        ColiCudaTensor *tg = NULL, *tu = NULL, *td = NULL;
+        int up_ok = coli_cuda_tensor_upload(&tg, w13, s13, 2, D, Iff, dev)
+                 && coli_cuda_tensor_upload(&tu, w13 + half, s13 + Iff, 2, D, Iff, dev)
+                 && coli_cuda_tensor_upload(&td, w2, s2, 2, Iff, D, dev);
+        if (!up_ok) { fprintf(stderr, "expert tensor upload failed\n"); fail++; }
+        else {
+            float *ycpu = malloc((size_t)D * 4), *ygpu = malloc((size_t)D * 4);
+            float *gg = malloc((size_t)O13 * 4);
+            matmul_q4(gg, x, w13, s13, D, O13);
+            for (int i = 0; i < Iff; i++) gg[i] = siluf(gg[i]) * gg[Iff + i];
+            matmul_q4(ycpu, gg, w2, s2, Iff, D);
+
+            int rows[1] = { 1 };
+            ColiCudaTensor *gs[1] = { tg }, *us[1] = { tu }, *ds[1] = { td };
+            if (!coli_cuda_expert_group(gs, us, ds, rows, 1, ygpu, x)) {
+                fprintf(stderr, "coli_cuda_expert_group refused\n"); fail++;
+            } else {
+                double e = rel_rms(ygpu, ycpu, D);
+                printf("\nfused expert  rel-RMS GPU vs CPU chain : %.5f\n", e);
+                printf("  cpu[0..3] % .5f % .5f % .5f % .5f\n", ycpu[0], ycpu[1], ycpu[2], ycpu[3]);
+                printf("  gpu[0..3] % .5f % .5f % .5f % .5f\n", ygpu[0], ygpu[1], ygpu[2], ygpu[3]);
+                if (e > 0.10) { printf("  !! fused path disagrees\n"); fail++; }
+                else printf("  => fused expert path agrees\n");
+            }
+            /* ---- same thing with count=8, which is what decode actually does ----
+             * The engine groups all K routed experts into one launch. Uploading
+             * the SAME expert eight times gives eight distinct tensors with
+             * identical contents, so every output row must equal the count=1
+             * answer; anything else is the grouping, not the arithmetic. */
+            {
+                enum { N = 8 };
+                ColiCudaTensor *g8[N], *u8[N], *d8[N];
+                int r8[N], up8 = 1;
+                for (int i = 0; i < N; i++) {
+                    g8[i] = u8[i] = d8[i] = NULL; r8[i] = 1;
+                    up8 &= coli_cuda_tensor_upload(&g8[i], w13, s13, 2, D, Iff, dev)
+                        && coli_cuda_tensor_upload(&u8[i], w13 + half, s13 + Iff, 2, D, Iff, dev)
+                        && coli_cuda_tensor_upload(&d8[i], w2, s2, 2, Iff, D, dev);
+                }
+                float *x8 = malloc((size_t)N * D * 4), *y8 = malloc((size_t)N * D * 4);
+                for (int i = 0; i < N; i++) memcpy(x8 + (size_t)i * D, x, (size_t)D * 4);
+                if (!up8 || !coli_cuda_expert_group(g8, u8, d8, r8, N, y8, x8)) {
+                    fprintf(stderr, "  !! grouped expert_group(count=8) refused\n"); fail++;
+                } else {
+                    double worst = 0; int bad_row = -1;
+                    for (int i = 0; i < N; i++) {
+                        double e = rel_rms(y8 + (size_t)i * D, ycpu, D);
+                        if (e > worst) { worst = e; bad_row = i; }
+                    }
+                    printf("\ngrouped x8    worst row rel-RMS vs CPU chain : %.5f (row %d)\n", worst, bad_row);
+                    for (int i = 0; i < N; i++)
+                        printf("  row %d [0..2] % .5f % .5f % .5f\n", i,
+                               y8[(size_t)i*D], y8[(size_t)i*D+1], y8[(size_t)i*D+2]);
+                    if (worst > 0.10) { printf("  !! grouping is where it breaks\n"); fail++; }
+                    else printf("  => grouping agrees too\n");
+                }
+                free(x8); free(y8);
+                for (int i = 0; i < N; i++) {
+                    if (g8[i]) coli_cuda_tensor_free(g8[i]);
+                    if (u8[i]) coli_cuda_tensor_free(u8[i]);
+                    if (d8[i]) coli_cuda_tensor_free(d8[i]);
+                }
+            }
+            free(ycpu); free(ygpu); free(gg);
+            coli_cuda_tensor_free(tg); coli_cuda_tensor_free(tu); coli_cuda_tensor_free(td);
+        }
+    }
+
     coli_cuda_shutdown();
     printf("\n%s\n", fail ? "EXPERT INT4 COMPAT: FAILED" : "expert int4 compat: ok");
     return fail ? 1 : 0;
