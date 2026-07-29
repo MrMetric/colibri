@@ -122,7 +122,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* hardware info panel */
 .hw-panel { display: grid; gap: 5px; padding: 8px 0; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+/* wrap rather than overflow: the GPU row carries a full device name plus an
+   arch string ("AMD Radeon Graphics (gfx906:sramecc+:xnack-)"), which is far
+   longer than the sidebar at narrow widths. */
 .hw-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--foreground); }
+.hw-row > span { min-width: 0; overflow-wrap: anywhere; }
 .hw-row svg { color: var(--primary); flex-shrink: 0; }
 .hw-row small { color: var(--muted-foreground); margin-left: 4px; }
 

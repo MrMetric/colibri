@@ -1440,6 +1440,15 @@ static void serve_hwinfo(Model *m) {
 #endif
     (void)m;
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n", cores, rt, ra, ngpu, vram, cpu[0]?cpu:"unknown", gpu);
+#ifdef COLI_CUDA
+    /* Resident dense weight, reported separately from TIERS on purpose: TIERS
+     * is the EXPERT cortex (counts of experts per tier) and what laguna keeps
+     * in VRAM is not an expert, it is the attention/lm_head/shared-expert
+     * bf16. Folding the bytes into the expert row produced a "VRAM 0 · 3.6 GB"
+     * legend — two taxonomies in one line. This belongs beside the GPU's
+     * capacity in the runtime panel instead. */
+    if (g_cuda) { printf("GPUMEM %.2f %.2f\n", g_vram_bytes/1e9, vram); }
+#endif
     fflush(stdout);
 }
 
@@ -1450,17 +1459,11 @@ static void serve_tiers_emap(Model *m) {
     int64_t I = c->moe_inter, D = c->hidden;
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
-    /* The three counts are EXPERT placement, and laguna puts no expert on the
-     * GPU — every routed expert lives in the RAM cache or on disk — so the
-     * VRAM count is genuinely 0. The GB figure is not: the dense bf16 weights
-     * (attention + lm_head + shared experts) are resident, and reporting 0.00
-     * there told the dashboard the GPU was unused while it was doing half the
-     * decode. Count and bytes describe different things here, on purpose. */
-    double vram_gb = 0;
-#ifdef COLI_CUDA
-    vram_gb = g_vram_bytes / 1e9;
-#endif
-    printf("TIERS 0 %d %d %.2f %.2f\n", filled, nsp*E - filled, vram_gb, filled*(double)slotb/1e9);
+    /* Both VRAM figures are 0 because this row is EXPERT placement and laguna
+     * puts no expert on the GPU — every routed expert lives in the RAM cache
+     * or on disk. The dense weights that DO sit in VRAM are reported by
+     * GPUMEM, not here; see serve_hwinfo. */
+    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;

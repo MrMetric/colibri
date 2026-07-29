@@ -41,12 +41,21 @@ export interface HwinfoHealth {
   gpu: string
 }
 
+/* Weights the engine holds in VRAM. NOT the same as TiersHealth.vram, which
+ * counts experts in VRAM — an engine can hold gigabytes of dense weight there
+ * while keeping every expert in RAM. Absent unless the engine reports it. */
+export interface GpuMemHealth {
+  used_gb: number
+  total_gb: number
+}
+
 export interface HealthResponse {
   status: string
   scheduler?: SchedulerHealth
   kv_slots?: number
   tiers?: TiersHealth
   hwinfo?: HwinfoHealth
+  gpumem?: GpuMemHealth
 }
 
 export interface ProfileTurn {

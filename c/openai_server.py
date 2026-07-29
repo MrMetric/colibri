@@ -1188,6 +1188,7 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.gpumem = None    # GPUMEM: VRAM-resident weights, if the engine reports any
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
@@ -1274,6 +1275,13 @@ class Engine:
                                    "vram_total_gb": float(fields[5]),
                                    "cpu": parts[0].strip() if len(parts)>0 else "",
                                    "gpu": parts[1].strip() if len(parts)>1 else ""}
+                elif kind == "GPUMEM" and len(fields) >= 3:
+                    # Weights an engine holds in VRAM. Distinct from tiers.vram_gb,
+                    # which counts EXPERTS in VRAM: laguna keeps zero experts there
+                    # and several GB of dense attention/lm_head weight, so the two
+                    # numbers are not substitutes. Optional -- engines that put
+                    # nothing but experts on the GPU never send it.
+                    self.gpumem = {"used_gb": float(fields[1]), "total_gb": float(fields[2])}
                 elif kind == "EMAP" and len(fields) == 4:
                     self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
                 elif kind == "HITS" and len(fields) == 4:
@@ -1649,6 +1657,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    gpumem = getattr(self.server.engine, "gpumem", None) if self.server.engine else None
+                    if gpumem: payload["gpumem"] = gpumem
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
