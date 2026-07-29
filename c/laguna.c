@@ -211,11 +211,36 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
+#ifdef COLI_CUDA
+/* GPU_VERIFY=1 is the CPU-parity gate for the GPU path: keep the host copy of
+ * every uploaded tensor, run both implementations on every matmul, and report
+ * the worst deviation at the end of a generation. Costs a doubled dense-weight
+ * RSS and roughly doubled decode time, so it is opt-in, but it is the only
+ * thing that distinguishes "the GPU produced a different answer" from "the GPU
+ * produced a wrong answer" — the two look identical in the output text. */
+static int    g_gpu_verify;
+static double g_gv_max, g_gv_ref;
+static long   g_gv_calls;
+#endif
+
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
 #ifdef COLI_CUDA
     if (W.dev) {
-        if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
-        fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
+        if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) != 0) {
+            fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
+        }
+        if (g_gpu_verify && W.h) {
+            float *ref = malloc((size_t)S * O * 4);
+            if (!ref) { fprintf(stderr, "GPU_VERIFY: OOM on %dx%d reference\n", S, O); exit(1); }
+            matmul_h(ref, x, W.h, S, I, O);
+            for (int i = 0; i < S * O; i++) {
+                double d = fabs((double)y[i] - (double)ref[i]);
+                if (d > g_gv_max) { g_gv_max = d; g_gv_ref = fabs((double)ref[i]); }
+            }
+            g_gv_calls++;
+            free(ref);
+        }
+        return;
     }
 #endif
     if (W.f) matmul(y, x, W.f, S, I, O);
@@ -593,7 +618,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
 #ifdef COLI_CUDA
         if (g_cuda && gpu_ok && ink_cuda_free_bytes() > (size_t)t->nbytes + (3ULL<<30)) {
             w.dev = ink_cuda_upload(w.h, t->nbytes);
-            if (w.dev) { free(w.h); w.h = NULL; }
+            if (w.dev && !g_gpu_verify) { free(w.h); w.h = NULL; }
         }
 #else
         (void)gpu_ok;
@@ -670,8 +695,19 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     Cfg *c = &m->c;
     double t0 = now_s();
 #ifdef COLI_CUDA
-    if (!getenv("NOGPU")) {
-        int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
+    /* Same switches the rest of the project uses, so `coli --gpu none` and
+     * COLI_GPU/COLI_GPUS reach this engine too. Only one device is used here
+     * (the backend has no multi-GPU split), so a COLI_GPUS list means "the
+     * first of these"; GPU_DEV stays as the engine-local override. */
+    const char *gpus = getenv("COLI_GPUS") ? getenv("COLI_GPUS") : getenv("COLI_GPU");
+    int gpu_off = getenv("NOGPU")
+                || (getenv("COLI_CUDA") && !atoi(getenv("COLI_CUDA")))
+                || (gpus && !strcmp(gpus, "none"));
+    if (!gpu_off) {
+        g_gpu_verify = getenv("GPU_VERIFY") && atoi(getenv("GPU_VERIFY"));
+        int dev = 0;
+        if (getenv("GPU_DEV"))                   dev = atoi(getenv("GPU_DEV"));
+        else if (gpus && strcmp(gpus, "auto"))   dev = atoi(gpus);
         if (ink_cuda_init(dev) == 0) {
             g_cuda = 1;
             fprintf(stderr, "[cuda] device %d ready, %.1f GB free\n", dev, ink_cuda_free_bytes()/1e9);
@@ -1213,6 +1249,11 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         if (s == n_new - 1) break;
         logit = step(m, &one, 1, len - 1, NULL);
     }
+#ifdef COLI_CUDA
+    if (g_gpu_verify)
+        printf("\n[gpu-verify] %ld checked matmuls, worst |gpu-cpu| = %.6g (that element |cpu| = %.6g)\n",
+               g_gv_calls, g_gv_max, g_gv_ref);
+#endif
     double dt = now_s() - t1;
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
@@ -1468,7 +1509,12 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
-#ifndef COLI_CUDA
+    /* Unlike colibri.c, this block is NOT gated on COLI_CUDA. The GPU backend
+     * here only takes the dense bf16 matmuls (attention, lm_head); every
+     * routed expert stays on the CPU, so OMP tuning matters at least as much
+     * with a GPU attached as without. Skipping it costs everything: measured
+     * on a 5950X + MI50, GPU decode is 8.7 tok/s tuned and 0.24 tok/s untuned
+     * (libgomp defaults to 32 SMT threads, and expert-mm goes 0.3s -> 130s). */
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         /* If OMP_PROC_BIND/OMP_PLACES were already in the environment, libgomp
          * bound this initial thread to a single-CPU place BEFORE main() ran; an
@@ -1498,7 +1544,6 @@ int main(int argc, char **argv) {
         else if (nt[0]) omp_set_num_threads(atoi(nt));
 #endif
     }
-#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_laguna.json";

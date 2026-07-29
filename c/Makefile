@@ -214,6 +214,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
+INK_CUDA_OBJ =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_rans$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -252,6 +253,7 @@ endif
 CFLAGS    += -DCOLI_CUDA
 LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
 CUDA_OBJ   = backend_cuda.o
+INK_CUDA_OBJ = backend_cuda_ink.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
@@ -333,9 +335,11 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
+# Same one-source-two-vendors story as backend_cuda.o: nvcc under CUDA=1,
+# hipcc under HIP=1, every difference confined to backend_gpu_compat.h.
+backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda_ink.cu -o $@
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -394,6 +398,14 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
+# inkling/laguna bf16 matmul against a double-precision reference. Separate
+# from cuda-test because it exercises the OTHER backend (backend_cuda_ink.cu),
+# whose 32-lane reduction is the part a 64-lane wavefront can silently break.
+ink-test: backend_cuda_ink.cu backend_cuda_ink.h backend_gpu_compat.h tests/test_backend_cuda_ink.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda_ink.cu tests/test_backend_cuda_ink.cu -o backend_cuda_ink_test$(EXE)
+	./backend_cuda_ink_test$(EXE)
+
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
@@ -410,8 +422,8 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
-laguna$(EXE): laguna.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h
-	$(CC) $(CFLAGS) laguna.c -o laguna$(EXE) $(LDFLAGS)
+laguna$(EXE): laguna.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h $(INK_CUDA_OBJ)
+	$(CC) $(CFLAGS) laguna.c $(INK_CUDA_OBJ) -o laguna$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks

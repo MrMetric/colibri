@@ -1,10 +1,21 @@
-/* CUDA backend for inkling.c — see backend_cuda_ink.h for scope.
- * One warp per output row, both operands rounded to bf16, f32 accumulate:
- * the same numeric contract as the CPU vdpbf16ps path (matmul_h), so GPU
- * and CPU runs stay closely comparable. */
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+/* CUDA/HIP backend for inkling.c and laguna.c — see backend_cuda_ink.h for
+ * scope. One 32-lane group per output row, weights bf16 (as stored), the
+ * activation kept in f32, f32 accumulate.
+ *
+ * The activation used to be rounded to bf16 first, to copy the numeric
+ * contract of matmul_h's _mm512_dpbf16_ps path so GPU and CPU runs stayed
+ * comparable. That only holds on a host with AVX512-BF16: matmul_h's scalar
+ * fallback multiplies f32 activations by bf16 weights, so on everything else
+ * the rounding made the GPU the *less* accurate of the two and broke the
+ * comparability it was there to provide. Measured on a 5950X + MI50, worst
+ * per-matmul |gpu-cpu| over a 40-layer Laguna XS decode: 1.07 on an element
+ * of magnitude 490 (0.22%) with the rounding, 1.4e-4 without — i.e. down to
+ * plain f32 summation-order noise. Dropping it costs nothing (the kernel is
+ * bound by the weight-row reads) and can only raise accuracy on a vdpbf16ps
+ * host too, so it is unconditional rather than a build flag. */
 #include <stdio.h>
+#include <string.h>
+#include "backend_gpu_compat.h"
 #include "backend_cuda_ink.h"
 
 static cudaStream_t g_st;
@@ -57,11 +68,11 @@ __global__ void mm_bf16_kernel(const __nv_bfloat16 * __restrict__ W,
     float acc = 0.f;
     for (int i = lane * 2; i < I; i += 64) {
         __nv_bfloat162 wv = *(const __nv_bfloat162 *)(w + i);
-        float xa = __bfloat162float(__float2bfloat16(xs[i]));
-        float xb = __bfloat162float(__float2bfloat16(xs[i + 1]));
+        float xa = xs[i];
+        float xb = xs[i + 1];
         acc += __bfloat162float(wv.x) * xa + __bfloat162float(wv.y) * xb;
     }
-    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    for (int off = 16; off; off >>= 1) acc += coli_shfl_down32(acc, off);
     if (!lane) y[(size_t)s * O + o] = acc;
 }
 

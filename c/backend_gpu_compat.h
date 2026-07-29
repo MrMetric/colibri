@@ -24,6 +24,7 @@
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 /* rocWMMA requires matrix cores (MFMA: gfx908+, WMMA: gfx11xx); on other
  * targets (gfx906, gfx101x, gfx103x) its headers static_assert. The Makefile
  * passes -DCOLI_HIP_NO_WMMA for those archs: the WMMA kernel bodies stay
@@ -89,10 +90,30 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
+#define cudaSetDeviceFlags       hipSetDeviceFlags
+#define cudaDeviceScheduleSpin   hipDeviceScheduleSpin
+/* bf16 surface used by backend_cuda_ink.cu. hip_bf16.h's __hip_bfloat16 is a
+ * struct with the same {x,y} layout and the same conversion helper names, so
+ * only the type names need mapping. */
+#define __nv_bfloat16            __hip_bfloat16
+#define __nv_bfloat162           __hip_bfloat162
+/* 32-lane logical sub-group reduction. The CUDA spelling
+ * __shfl_down_sync(0xffffffffu, ...) is a hard compile error under HIP:
+ * __shfl_*_sync static_asserts a 64-bit mask that must equal the active lanes,
+ * and a 32-bit full mask does not describe a 64-lane wave. __shfl_down takes
+ * the width instead of a mask, which is also the honest spelling here — the
+ * ink kernel gives one output row to a 32-thread group whatever the hardware
+ * wavefront is, so 32 is a property of the kernel, not of the target. (On
+ * gfx906 the inherited width=warpSize=64 happens to give the same answer,
+ * since the offsets 16..1 only ever reach within each 32-lane half; stating
+ * the width keeps that from being load-bearing luck.) */
+#define coli_shfl_down32(v, off) __shfl_down((v), (off), 32)
 #else
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
+#define coli_shfl_down32(v, off) __shfl_down_sync(0xffffffffu, (v), (off), 32)
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */
