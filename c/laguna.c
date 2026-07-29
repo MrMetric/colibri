@@ -730,15 +730,27 @@ static int experts_upload(Model *m, int dev) {
 	size_t need = (size_t)nsp * E * (2 * wg + wd)               /* weights  */
 	            + (size_t)nsp * E * (2 * I + D) * sizeof(float); /* scales   */
 	size_t freeb = 0, totb = 0;
-	if (coli_cuda_mem_info(dev, &freeb, &totb) != 1) return 0;
 	/* Leave headroom for the backend's own activation scratch and for the dense
 	 * tensors the ink backend holds; running the card to the last byte turns a
 	 * capacity problem into a mid-decode allocation failure. */
 	size_t margin = 2ULL << 30;
-	if (need + margin > freeb) {
-		fprintf(stderr, "[cuda] experts stay on CPU: need %.1f GB + %.1f GB margin, %.1f GB free\n",
-		        need / 1e9, margin / 1e9, freeb / 1e9);
-		return 0;
+	/* Retry on capacity. A previous engine's 15.8 GB is often still held when the
+	 * next one starts -- `coli` spawns the child without waiting for the old
+	 * process to finish releasing -- and losing residency to that race costs half
+	 * the decode speed with no symptom except a slow session. Observed 19 GB still
+	 * in use at the moment a back-to-back run checked. */
+	for (int attempt = 0; ; attempt++) {
+		if (coli_cuda_mem_info(dev, &freeb, &totb) != 1) return 0;
+		if (need + margin <= freeb) break;
+		if (attempt >= 4) {
+			fprintf(stderr, "[cuda] experts stay on CPU: need %.1f GB + %.1f GB margin, "
+			        "%.1f GB free after %d retries\n", need / 1e9, margin / 1e9, freeb / 1e9, attempt);
+			return 0;
+		}
+		fprintf(stderr, "[cuda] %.1f GB free, need %.1f GB — waiting for VRAM (another engine "
+		        "may still be exiting), attempt %d/5\n", freeb / 1e9, (need + margin) / 1e9, attempt + 1);
+		struct timespec ts = { 2, 0 };
+		nanosleep(&ts, NULL);
 	}
 
 	g_eg = calloc(c->n_layers, sizeof(*g_eg));
@@ -877,8 +889,15 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         (!getenv("EXPERTS_VRAM") || atoi(getenv("EXPERTS_VRAM")))) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
         int devs[1] = { dev };
-        if (coli_cuda_init(devs, 1) > 0 && experts_upload(m, dev)) g_exp_vram = 1;
-        else coli_cuda_shutdown();
+        if (coli_cuda_init(devs, 1) <= 0) {
+            /* loud: a silent decline here looks exactly like success from the
+             * outside, and the engine quietly runs 2x slower on the CPU cache */
+            fprintf(stderr, "[cuda] coli_cuda_init(%d) failed; experts stay on CPU\n", dev);
+        } else if (experts_upload(m, dev)) {
+            g_exp_vram = 1;
+        } else {
+            coli_cuda_shutdown();
+        }
     }
     /* With every expert resident the RAM cache is dead weight, so it shrinks to
      * nothing -- EXCEPT under GPU_VERIFY, where the CPU chain is recomputed for
