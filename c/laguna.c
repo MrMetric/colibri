@@ -1306,14 +1306,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_expert += now_s() - te;
 shared: ;
+    }
+    /* Shared expert, batched over all S tokens rather than one row at a time.
+     * It is the same dense MLP for every token, so a prefill of S tokens was
+     * issuing 3*S tiny one-row matmuls per layer where three S-row ones do. On
+     * a 1025-token prompt that phase measured 5.0s of a 35.2s prefill; batching
+     * is free for decode, where S is 1 either way.
+     *
+     * Note this is NOT what the routed experts want: coli_cuda_expert_group
+     * sizes its grid by max_rows*count, so batching rows onto skewed expert
+     * assignments does MORE work, not less — measured 45% slower at S=513.
+     * Dense is batchable, routed is not. */
+    {
         double ts = now_s();
-        /* shared expert (unscaled — route_scale only applies to routed experts) */
-        matmul_w(g, xs, l->sh_g, 1, D, I);
-        matmul_w(u, xs, l->sh_u, 1, D, I);
-        for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-        matmul_w(hh, g, l->sh_d, 1, I, D);
-        /* os currently holds sum(w[kk] * expert_hh[kk]); apply route_scale, then add shared */
-        for (int d = 0; d < D; d++) os[d] = os[d] * c->route_scale + hh[d];
+        float *sg = falloc((int64_t)S*I), *su = falloc((int64_t)S*I), *sh = falloc((int64_t)S*D);
+        matmul_w(sg, x, l->sh_g, S, D, I);
+        matmul_w(su, x, l->sh_u, S, D, I);
+        for (int64_t i = 0; i < (int64_t)S*I; i++) sg[i] = siluf(sg[i]) * su[i];
+        matmul_w(sh, sg, l->sh_d, S, I, D);
+        /* out holds sum(w[kk] * expert_hh[kk]); apply route_scale, then add shared */
+        for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] = out[i] * c->route_scale + sh[i];
+        free(sg); free(su); free(sh);
         m->t_shared += now_s() - ts;
     }
     free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
